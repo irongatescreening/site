@@ -1,50 +1,58 @@
 import os
 import time
-from datetime import timedelta
-
-import jwt
 import requests
 from flask import Flask, request, session, redirect, url_for
 
 app = Flask(__name__)
 
 # -------------------------
-# Config
+# REQUIRED ENV VARS (Render)
 # -------------------------
-app.secret_key = os.environ["FLASK_SECRET_KEY"]
+FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
+SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com").rstrip("/")
+AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip(
+    "/"
+)
+ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
-SUPABASE_JWT_SECRET = os.environ["SUPABASE_JWT_SECRET"]
+# Fail fast with clear errors (prevents mystery crashes)
+missing = []
+if not FLASK_SECRET_KEY:
+    missing.append("FLASK_SECRET_KEY")
+if not SUPABASE_URL:
+    missing.append("SUPABASE_URL")
+if not SUPABASE_ANON_KEY:
+    missing.append("SUPABASE_ANON_KEY")
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-SITE_URL = os.environ.get("SITE_URL", "https://portal.irongatescreening.com").rstrip("/")
-AUTH_REDIRECT_TO = os.environ.get("AUTH_REDIRECT_TO", f"{SITE_URL}/auth/callback").rstrip("/")
-
-ALLOWLIST = {e.strip().lower() for e in os.environ.get("ALLOWLIST_EMAILS", "").split(",") if e.strip()}
-
-# Cookie hardening
+# -------------------------
+# Flask config (secure cookies)
+# -------------------------
+app.secret_key = FLASK_SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,  # HTTPS only
+    SESSION_COOKIE_HTTPONLY=True,  # JS can't read
+    SESSION_COOKIE_SAMESITE="Lax",  # CSRF mitigation
 )
 
-cookie_domain = os.environ.get("SESSION_COOKIE_DOMAIN")
-if cookie_domain:
-    app.config["SESSION_COOKIE_DOMAIN"] = cookie_domain
+# If you want cookies limited to only portal.irongatescreening.com:
+# app.config["SESSION_COOKIE_DOMAIN"] = "portal.irongatescreening.com"
 
-# Optional: timebox our own session to reduce risk
-app.permanent_session_lifetime = timedelta(hours=8)
-
-
-def is_allowed(email: str) -> bool:
-    return email and email.strip().lower() in ALLOWLIST
+# Invite-only allowlist
+ALLOWLIST = {e.strip().lower() for e in ALLOWLIST_EMAILS.split(",") if e.strip()}
 
 
-def send_magic_link(email: str) -> None:
+def is_allowed_email(email: str) -> bool:
+    return bool(email) and email.strip().lower() in ALLOWLIST
+
+
+def supabase_send_magic_link(email: str) -> None:
     """
-    Sends a magic link via Supabase /otp endpoint.
-    Supabase will email the user and redirect them to AUTH_REDIRECT_TO with tokens in URL fragment.
+    Sends a magic link (OTP email) via Supabase.
+    NOTE: This does NOT create new users (invite-only).
     """
     url = f"{SUPABASE_URL}/auth/v1/otp"
     headers = {
@@ -59,30 +67,43 @@ def send_magic_link(email: str) -> None:
     }
     r = requests.post(url, json=payload, headers=headers, timeout=10)
     if r.status_code not in (200, 201):
-        raise RuntimeError(r.text)
+        raise RuntimeError(f"Supabase OTP send failed: {r.status_code} {r.text}")
 
 
-def verify_supabase_jwt(access_token: str) -> dict:
+def supabase_get_user(access_token: str) -> dict:
     """
-    Verify Supabase JWT signature server-side.
-    Returns decoded payload if valid.
+    Uses Supabase to validate the token and return the user profile.
+    This avoids legacy JWT secret requirements.
     """
-    # Supabase uses HS256 with the project's JWT secret by default
-    return jwt.decode(access_token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {access_token}",
+    }
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"Supabase /user failed: {r.status_code} {r.text}")
+    return r.json()
 
 
-@app.get("/")
+def require_login():
+    if not session.get("user_email"):
+        return redirect(url_for("login"))
+    return None
+
+
+@app.route("/")
 def home():
     if session.get("user_email"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
 
-@app.get("/login")
+@app.route("/login", methods=["GET"])
 def login():
     return """
     <h2>IGS Portal Login</h2>
-    <p>Invite-only access. Enter your email to receive a secure sign-in link.</p>
+    <p>Enter your email to receive a secure sign-in link.</p>
     <form method="POST" action="/login">
       <input name="email" type="email" placeholder="you@company.com" required />
       <button type="submit">Send login link</button>
@@ -90,114 +111,126 @@ def login():
     """
 
 
-@app.post("/login")
+@app.route("/login", methods=["POST"])
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
 
-    # Don’t reveal whether allowlisted (prevents enumeration)
-    if not is_allowed(email):
+    # Invite-only gate (avoid email enumeration)
+    if not is_allowed_email(email):
         time.sleep(1)
         return """
         <h3>If that email is authorized, you’ll receive a sign-in link shortly.</h3>
+        <p>You can close this window.</p>
         """, 200
 
     try:
-        send_magic_link(email)
+        supabase_send_magic_link(email)
     except Exception:
+        # Generic error (don’t leak details)
         return "<h3>Could not send login link. Try again.</h3>", 500
 
     return """
     <h3>Check your email</h3>
-    <p>If your email is authorized, you’ll receive a secure sign-in link shortly.</p>
+    <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
     """
 
 
-@app.get("/auth/callback")
+@app.route("/auth/callback", methods=["GET"])
 def auth_callback():
     """
-    Supabase magic link returns tokens in the URL fragment (#access_token=...),
-    which the server can't read directly.
-    We solve that by serving a tiny page that POSTs the fragment to /auth/consume.
+    Supabase magic links commonly return tokens in the URL fragment (#access_token=...).
+    The server cannot read fragments, so this page extracts the token and POSTs it to /auth/consume.
     """
     return """
     <html><body>
-    <script>
-      // Extract token data from URL fragment and send to server
-      const fragment = new URLSearchParams(window.location.hash.slice(1));
-      const access_token = fragment.get('access_token');
-      if (!access_token) {
-        document.body.innerHTML = "<h3>Login failed. Missing token.</h3>";
-      } else {
-        fetch('/auth/consume', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({access_token})
-        }).then(() => window.location = '/dashboard')
-          .catch(() => document.body.innerHTML = "<h3>Login failed.</h3>");
-      }
-    </script>
+      <script>
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const access_token = fragment.get('access_token');
+
+        if (!access_token) {
+          document.body.innerHTML = "<h3>Login failed: missing token.</h3>";
+        } else {
+          fetch('/auth/consume', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({access_token})
+          })
+          .then(res => {
+            if (!res.ok) throw new Error('auth failed');
+            window.location = '/dashboard';
+          })
+          .catch(() => {
+            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+          });
+        }
+      </script>
     </body></html>
     """
 
 
-@app.post("/auth/consume")
+@app.route("/auth/consume", methods=["POST"])
 def auth_consume():
+    """
+    One-time token consumption endpoint.
+    We do NOT store Supabase tokens. We only store user_email/user_id in Flask session.
+    """
     data = request.get_json(silent=True) or {}
     access_token = data.get("access_token")
     if not access_token:
         return {"ok": False}, 400
 
     try:
-        payload = verify_supabase_jwt(access_token)
+        user = supabase_get_user(access_token)
     except Exception:
         return {"ok": False}, 401
 
-    email = (payload.get("email") or "").strip().lower()
-    if not is_allowed(email):
+    email = (user.get("email") or "").strip().lower()
+    if not is_allowed_email(email):
         session.clear()
         return {"ok": False}, 403
 
-    # Only store minimal identity server-side (status-only portal)
-    session.permanent = True
+    # Store minimal identity only (status-only portal)
     session["user_email"] = email
-    session["sub"] = payload.get("sub")
+    session["user_id"] = user.get("id")
 
     return {"ok": True}, 200
 
 
-@app.get("/dashboard")
+@app.route("/dashboard", methods=["GET"])
 def dashboard():
-    if not session.get("user_email"):
-        return redirect(url_for("login"))
+    gate = require_login()
+    if gate:
+        return gate
 
-    email = session["user_email"]
+    email = session.get("user_email") or ""
 
+    # Status-only dashboard placeholder
     return f"""
     <h2>IGS Portal</h2>
     <p>Signed in as: <b>{email}</b></p>
 
-    <h3>Status (MVP)</h3>
+    <h3>Status</h3>
     <ul>
       <li>John Doe — Invitation sent</li>
       <li>Jane Smith — In progress</li>
-      <li>Dan Smith — Complete — <a href="#" onclick="alert('Next: View Report deep-link'); return false;">View report</a></li>
+      <li>Dan Smith — Complete — <a href="#" onclick="alert('Later: deep link to Certn'); return false;">View report</a></li>
     </ul>
 
     <p><a href="/logout">Logout</a></p>
     """
 
 
-@app.get("/logout")
+@app.route("/logout", methods=["GET"])
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
 
-@app.get("/healthz")
+@app.route("/healthz", methods=["GET"])
 def healthz():
     return {"ok": True}, 200
 
 
 if __name__ == "__main__":
-    # local dev
+    # Local dev only. Render uses gunicorn start command.
     app.run(host="0.0.0.0", port=5000, debug=True)
