@@ -114,6 +114,8 @@ def login():
 @app.route("/login", methods=["POST"])
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
+    print("SUPABASE OTP:", r.status_code, r.text)
+
 
     # Invite-only gate (avoid email enumeration)
     if not is_allowed_email(email):
