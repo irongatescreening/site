@@ -74,7 +74,7 @@ def supabase_send_magic_link(email: str) -> None:
 def supabase_exchange_code_for_session(code: str) -> dict:
     """
     Some Supabase flows redirect back with ?code=... (PKCE exchange).
-    Exchange it server-side for an access token.
+    Exchange it server-side for an access token.a
     """
     url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
     headers = {
@@ -116,19 +116,41 @@ def home():
     if session.get("user_email"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
-
-
 @app.get("/login")
 def login():
     return """
-    <h2>IGS Portal Login</h2>
-    <p>Enter your email to receive a secure sign-in link.</p>
-    <form method="POST" action="/login">
-      <input name="email" type="email" placeholder="you@company.com" required />
-      <button type="submit">Send login link</button>
-    </form>
-    """
+    <html>
+    <body>
+      <script>
+        // If Supabase redirected here with an access token, consume it automatically
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const access_token = fragment.get('access_token');
 
+        if (access_token) {
+          fetch('/auth/consume', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({access_token})
+          })
+          .then(res => {
+            if (!res.ok) throw new Error('auth failed');
+            window.location = '/dashboard';
+          })
+          .catch(() => {
+            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+          });
+        }
+      </script>
+
+      <h2>IGS Portal Login</h2>
+      <p>Enter your email to receive a secure sign-in link.</p>
+      <form method="POST" action="/login">
+        <input name="email" type="email" placeholder="you@company.com" required />
+        <button type="submit">Send login link</button>
+      </form>
+    </body>
+    </html>
+    """
 
 @app.post("/login")
 def login_post():
@@ -144,14 +166,14 @@ def login_post():
 
     try:
         supabase_send_magic_link(email)
-        return """
-        <h3>Check your email</h3>
-        <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
-        """, 200
-
     except Exception:
-        app.logger.exception("Supabase OTP send failed")
+        # Generic error (don’t leak details)
         return "<h3>Could not send login link. Try again.</h3>", 500
+
+    return """
+    <h3>Check your email</h3>
+    <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
+    """
 
 
 @app.get("/auth/callback")
