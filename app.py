@@ -114,8 +114,11 @@ def login():
 @app.route("/login", methods=["POST"])
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
-    print("SUPABASE OTP:", r.status_code, r.text)
-
+        try:
+        supabase_send_magic_link(email)
+    except Exception as e:
+        app.logger.exception("Login link send failed")
+        return f"<h3>Could not send login link.</h3><pre>{str(e)}</pre>", 500
 
     # Invite-only gate (avoid email enumeration)
     if not is_allowed_email(email):
