@@ -16,6 +16,7 @@ SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com"
 AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
+# Fail fast with clear errors (prevents mystery crashes)
 missing = []
 if not FLASK_SECRET_KEY:
     missing.append("FLASK_SECRET_KEY")
@@ -47,8 +48,8 @@ def is_allowed_email(email: str) -> bool:
 def supabase_send_magic_link(email: str) -> None:
     """
     Sends a magic link (OTP email) via Supabase.
-    If you want ONE-step onboarding (no 'invite' email), set create_user=True.
-    If you want strict pre-created users only, set create_user=False.
+    create_user=True  => one-step onboarding (recommended UX)
+    create_user=False => requires user already exists / invited
     """
     url = f"{SUPABASE_URL}/auth/v1/otp"
     headers = {
@@ -59,9 +60,6 @@ def supabase_send_magic_link(email: str) -> None:
 
     payload = {
         "email": email,
-        # CHANGE THIS:
-        # True  = one-step: type email -> link -> logged in (recommended UX)
-        # False = requires user already exists / invited
         "create_user": True,
         "redirect_to": AUTH_REDIRECT_TO,
     }
@@ -74,7 +72,7 @@ def supabase_send_magic_link(email: str) -> None:
 def supabase_exchange_code_for_session(code: str) -> dict:
     """
     Some Supabase flows redirect back with ?code=... (PKCE exchange).
-    Exchange it server-side for an access token.a
+    Exchange it server-side for an access token.
     """
     url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
     headers = {
@@ -111,46 +109,27 @@ def require_login():
     return None
 
 
+# -------------------------
+# Routes
+# -------------------------
 @app.get("/")
 def home():
     if session.get("user_email"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
+
+
 @app.get("/login")
 def login():
     return """
-    <html>
-    <body>
-      <script>
-        // If Supabase redirected here with an access token, consume it automatically
-        const fragment = new URLSearchParams(window.location.hash.slice(1));
-        const access_token = fragment.get('access_token');
-
-        if (access_token) {
-          fetch('/auth/consume', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({access_token})
-          })
-          .then(res => {
-            if (!res.ok) throw new Error('auth failed');
-            window.location = '/dashboard';
-          })
-          .catch(() => {
-            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
-          });
-        }
-      </script>
-
-      <h2>IGS Portal Login</h2>
-      <p>Enter your email to receive a secure sign-in link.</p>
-      <form method="POST" action="/login">
-        <input name="email" type="email" placeholder="you@company.com" required />
-        <button type="submit">Send login link</button>
-      </form>
-    </body>
-    </html>
+    <h2>IGS Portal Login</h2>
+    <p>Enter your email to receive a secure sign-in link.</p>
+    <form method="POST" action="/login">
+      <input name="email" type="email" placeholder="you@company.com" required />
+      <button type="submit">Send login link</button>
+    </form>
     """
+
 
 @app.post("/login")
 def login_post():
