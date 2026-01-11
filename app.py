@@ -118,17 +118,49 @@ def home():
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
-
 @app.get("/login")
 def login():
-    return """
-    <h2>IGS Portal Login</h2>
-    <p>Enter your email to receive a secure sign-in link.</p>
-    <form method="POST" action="/login">
-      <input name="email" type="email" placeholder="you@company.com" required />
-      <button type="submit">Send login link</button>
-    </form>
+    # Create a one-time nonce for token consumption (prevents CSRF-ish misuse)
+    nonce = secrets.token_urlsafe(32)
+    session["consume_nonce"] = nonce
+
+    return f"""
+    <html>
+    <body>
+      <script>
+        // If Supabase redirected here with an access token (in the URL fragment),
+        // consume it automatically and set server-side session.
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const access_token = fragment.get('access_token');
+
+        if (access_token) {{
+          fetch('/auth/consume', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ access_token: access_token, nonce: '{nonce}' }})
+          }})
+          .then(res => {{
+            if (!res.ok) throw new Error('auth failed');
+            // Clean the URL (remove token fragment) then go to dashboard
+            window.location.replace('/dashboard');
+          }})
+          .catch(() => {{
+            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+          }});
+        }}
+      </script>
+
+      <h2>IGS Portal Login</h2>
+      <p>Enter your email to receive a secure sign-in link.</p>
+      <form method="POST" action="/login">
+        <input name="email" type="email" placeholder="you@company.com" required />
+        <button type="submit">Send login link</button>
+      </form>
+    </body>
+    </html>
     """
+
+
 
 
 @app.post("/login")
