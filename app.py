@@ -109,16 +109,9 @@ def login():
       <button type="submit">Send login link</button>
     </form>
     """
-
-
 @app.route("/login", methods=["POST"])
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
-        try:
-        supabase_send_magic_link(email)
-    except Exception as e:
-        app.logger.exception("Login link send failed")
-        return f"<h3>Could not send login link.</h3><pre>{str(e)}</pre>", 500
 
     # Invite-only gate (avoid email enumeration)
     if not is_allowed_email(email):
@@ -129,16 +122,34 @@ def login_post():
         """, 200
 
     try:
-        supabase_send_magic_link(email)
+        # Call Supabase to send the email
+        url = f"{SUPABASE_URL}/auth/v1/otp"
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "email": email,
+            "create_user": False,  # invite-only
+            "redirect_to": AUTH_REDIRECT_TO,
+        }
+
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+
+        # Log the real reason if Supabase rejects it
+        if r.status_code not in (200, 201):
+            app.logger.error("Supabase OTP failed: %s %s", r.status_code, r.text)
+            return "<h3>Could not send login link. Try again.</h3>", 500
+
     except Exception:
-        # Generic error (don’t leak details)
+        app.logger.exception("Supabase OTP request threw an exception")
         return "<h3>Could not send login link. Try again.</h3>", 500
 
     return """
     <h3>Check your email</h3>
     <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
     """
-
 
 @app.route("/auth/callback", methods=["GET"])
 def auth_callback():
