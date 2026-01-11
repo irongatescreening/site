@@ -16,7 +16,6 @@ SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com"
 AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
-# Fail fast so Render logs show what's wrong (prevents mystery crashes)
 missing = []
 if not FLASK_SECRET_KEY:
     missing.append("FLASK_SECRET_KEY")
@@ -32,13 +31,10 @@ if missing:
 # -------------------------
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=True,    # HTTPS only
-    SESSION_COOKIE_HTTPONLY=True,  # JS can't read
-    SESSION_COOKIE_SAMESITE="Lax", # CSRF mitigation baseline
+    SESSION_COOKIE_SECURE=True,     # HTTPS only
+    SESSION_COOKIE_HTTPONLY=True,   # JS can't read
+    SESSION_COOKIE_SAMESITE="Lax",  # CSRF mitigation baseline
 )
-
-# If you want cookies limited to only portal.irongatescreening.com:
-# app.config["SESSION_COOKIE_DOMAIN"] = "portal.irongatescreening.com"
 
 # Invite-only allowlist
 ALLOWLIST = {e.strip().lower() for e in ALLOWLIST_EMAILS.split(",") if e.strip()}
@@ -51,7 +47,8 @@ def is_allowed_email(email: str) -> bool:
 def supabase_send_magic_link(email: str) -> None:
     """
     Sends a magic link (OTP email) via Supabase.
-    NOTE: This does NOT create new users (invite-only).
+    If you want ONE-step onboarding (no 'invite' email), set create_user=True.
+    If you want strict pre-created users only, set create_user=False.
     """
     url = f"{SUPABASE_URL}/auth/v1/otp"
     headers = {
@@ -59,11 +56,16 @@ def supabase_send_magic_link(email: str) -> None:
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "email": email,
-        "create_user": False,      # invite-only: user must already exist / be invited
+        # CHANGE THIS:
+        # True  = one-step: type email -> link -> logged in (recommended UX)
+        # False = requires user already exists / invited
+        "create_user": True,
         "redirect_to": AUTH_REDIRECT_TO,
     }
+
     r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Supabase OTP failed: {r.status_code} {r.text}")
@@ -71,8 +73,8 @@ def supabase_send_magic_link(email: str) -> None:
 
 def supabase_exchange_code_for_session(code: str) -> dict:
     """
-    Some Supabase flows return ?code=... (PKCE-style exchange).
-    Exchange it server-side for access_token.
+    Some Supabase flows redirect back with ?code=... (PKCE exchange).
+    Exchange it server-side for an access token.
     """
     url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
     headers = {
@@ -147,22 +149,21 @@ def login_post():
         <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
         """, 200
 
-    except Exception as e:
+    except Exception:
         app.logger.exception("Supabase OTP send failed")
-        # Keep user-facing message simple; logs contain details
         return "<h3>Could not send login link. Try again.</h3>", 500
 
 
 @app.get("/auth/callback")
 def auth_callback():
     """
-    Handles BOTH common Supabase behaviors:
+    Handles BOTH Supabase behaviors:
       A) redirect back with ?code=... (server-side exchange)
       B) redirect back with #access_token=... (fragment). Server can't read fragment,
-         so we return HTML that extracts it and POSTs to /auth/consume.
+         so we return HTML that extracts it and POSTs it to /auth/consume.
     """
 
-    # A) If Supabase returned a code in querystring, do server-side exchange
+    # A) If Supabase returned ?code=..., do server-side exchange
     code = request.args.get("code")
     if code:
         try:
@@ -178,7 +179,6 @@ def auth_callback():
                 session.clear()
                 return "<h3>Not authorized.</h3>", 403
 
-            # Store minimal identity only (status-only portal)
             session["user_email"] = email
             session["user_id"] = user.get("id")
 
@@ -188,8 +188,7 @@ def auth_callback():
             app.logger.exception("Auth callback (code exchange) failed")
             return "<h3>Login failed. Please try again.</h3>", 400
 
-    # B) Otherwise, handle fragment token flow (#access_token=...)
-    # We also add a one-time CSRF-ish nonce to prevent random posts to /auth/consume.
+    # B) Fragment token flow: use HTML to extract #access_token=...
     nonce = secrets.token_urlsafe(32)
     session["consume_nonce"] = nonce
 
@@ -230,7 +229,6 @@ def auth_consume():
     access_token = (data.get("access_token") or "").strip()
     nonce = (data.get("nonce") or "").strip()
 
-    # Basic nonce check to reduce CSRF / random posts
     expected = session.get("consume_nonce")
     session.pop("consume_nonce", None)
     if not expected or nonce != expected:
@@ -250,7 +248,6 @@ def auth_consume():
         session.clear()
         return {"ok": False}, 403
 
-    # Store minimal identity only (status-only portal)
     session["user_email"] = email
     session["user_id"] = user.get("id")
 
@@ -265,7 +262,6 @@ def dashboard():
 
     email = session.get("user_email") or ""
 
-    # Status-only dashboard placeholder
     return f"""
     <h2>IGS Portal</h2>
     <p>Signed in as: <b>{email}</b></p>
@@ -298,5 +294,4 @@ def favicon():
 
 
 if __name__ == "__main__":
-    # Local dev only. Render uses gunicorn start command.
     app.run(host="0.0.0.0", port=5000, debug=True)
