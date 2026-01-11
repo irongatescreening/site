@@ -1,5 +1,6 @@
 import os
 import time
+import secrets
 import requests
 from flask import Flask, request, session, redirect, url_for
 
@@ -12,12 +13,10 @@ FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
 SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com").rstrip("/")
-AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip(
-    "/"
-)
+AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
-# Fail fast with clear errors (prevents mystery crashes)
+# Fail fast so Render logs show what's wrong (prevents mystery crashes)
 missing = []
 if not FLASK_SECRET_KEY:
     missing.append("FLASK_SECRET_KEY")
@@ -33,9 +32,9 @@ if missing:
 # -------------------------
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=True,  # HTTPS only
+    SESSION_COOKIE_SECURE=True,    # HTTPS only
     SESSION_COOKIE_HTTPONLY=True,  # JS can't read
-    SESSION_COOKIE_SAMESITE="Lax",  # CSRF mitigation
+    SESSION_COOKIE_SAMESITE="Lax", # CSRF mitigation baseline
 )
 
 # If you want cookies limited to only portal.irongatescreening.com:
@@ -62,25 +61,43 @@ def supabase_send_magic_link(email: str) -> None:
     }
     payload = {
         "email": email,
-        "create_user": False,  # invite-only
+        "create_user": False,      # invite-only: user must already exist / be invited
         "redirect_to": AUTH_REDIRECT_TO,
     }
-    r = requests.post(url, json=payload, headers=headers, timeout=10)
+    r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"Supabase OTP send failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Supabase OTP failed: {r.status_code} {r.text}")
+
+
+def supabase_exchange_code_for_session(code: str) -> dict:
+    """
+    Some Supabase flows return ?code=... (PKCE-style exchange).
+    Exchange it server-side for access_token.
+    """
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"auth_code": code}
+    r = requests.post(url, json=payload, headers=headers, timeout=15)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase token exchange failed: {r.status_code} {r.text}")
+    return r.json()
 
 
 def supabase_get_user(access_token: str) -> dict:
     """
-    Uses Supabase to validate the token and return the user profile.
-    This avoids legacy JWT secret requirements.
+    Validates the token and returns user profile from Supabase.
+    Avoids needing legacy JWT secrets.
     """
     url = f"{SUPABASE_URL}/auth/v1/user"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {access_token}",
     }
-    r = requests.get(url, headers=headers, timeout=10)
+    r = requests.get(url, headers=headers, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Supabase /user failed: {r.status_code} {r.text}")
     return r.json()
@@ -92,14 +109,14 @@ def require_login():
     return None
 
 
-@app.route("/")
+@app.get("/")
 def home():
     if session.get("user_email"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
 
-@app.route("/login", methods=["GET"])
+@app.get("/login")
 def login():
     return """
     <h2>IGS Portal Login</h2>
@@ -109,7 +126,9 @@ def login():
       <button type="submit">Send login link</button>
     </form>
     """
-@app.route("/login", methods=["POST"])
+
+
+@app.post("/login")
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
 
@@ -122,82 +141,108 @@ def login_post():
         """, 200
 
     try:
-        # Call Supabase to send the email
-        url = f"{SUPABASE_URL}/auth/v1/otp"
-        headers = {
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "email": email,
-            "create_user": False,  # invite-only
-            "redirect_to": AUTH_REDIRECT_TO,
-        }
+        supabase_send_magic_link(email)
+        return """
+        <h3>Check your email</h3>
+        <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
+        """, 200
 
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-
-        # Log the real reason if Supabase rejects it
-        if r.status_code not in (200, 201):
-            app.logger.error("Supabase OTP failed: %s %s", r.status_code, r.text)
-            return "<h3>Could not send login link. Try again.</h3>", 500
-
-    except Exception:
-        app.logger.exception("Supabase OTP request threw an exception")
+    except Exception as e:
+        app.logger.exception("Supabase OTP send failed")
+        # Keep user-facing message simple; logs contain details
         return "<h3>Could not send login link. Try again.</h3>", 500
 
-    return """
-    <h3>Check your email</h3>
-    <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
-    """
 
-@app.route("/auth/callback", methods=["GET"])
+@app.get("/auth/callback")
 def auth_callback():
     """
-    Supabase magic links commonly return tokens in the URL fragment (#access_token=...).
-    The server cannot read fragments, so this page extracts the token and POSTs it to /auth/consume.
+    Handles BOTH common Supabase behaviors:
+      A) redirect back with ?code=... (server-side exchange)
+      B) redirect back with #access_token=... (fragment). Server can't read fragment,
+         so we return HTML that extracts it and POSTs to /auth/consume.
     """
-    return """
+
+    # A) If Supabase returned a code in querystring, do server-side exchange
+    code = request.args.get("code")
+    if code:
+        try:
+            data = supabase_exchange_code_for_session(code)
+            access_token = (data.get("access_token") or "").strip()
+            if not access_token:
+                return "<h3>Login failed (no access token).</h3>", 400
+
+            user = supabase_get_user(access_token)
+            email = (user.get("email") or "").strip().lower()
+
+            if not is_allowed_email(email):
+                session.clear()
+                return "<h3>Not authorized.</h3>", 403
+
+            # Store minimal identity only (status-only portal)
+            session["user_email"] = email
+            session["user_id"] = user.get("id")
+
+            return redirect(url_for("dashboard"))
+
+        except Exception:
+            app.logger.exception("Auth callback (code exchange) failed")
+            return "<h3>Login failed. Please try again.</h3>", 400
+
+    # B) Otherwise, handle fragment token flow (#access_token=...)
+    # We also add a one-time CSRF-ish nonce to prevent random posts to /auth/consume.
+    nonce = secrets.token_urlsafe(32)
+    session["consume_nonce"] = nonce
+
+    return f"""
     <html><body>
       <script>
         const fragment = new URLSearchParams(window.location.hash.slice(1));
         const access_token = fragment.get('access_token');
 
-        if (!access_token) {
+        if (!access_token) {{
           document.body.innerHTML = "<h3>Login failed: missing token.</h3>";
-        } else {
-          fetch('/auth/consume', {
+        }} else {{
+          fetch('/auth/consume', {{
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({access_token})
-          })
-          .then(res => {
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{access_token, nonce: '{nonce}'}})
+          }})
+          .then(res => {{
             if (!res.ok) throw new Error('auth failed');
             window.location = '/dashboard';
-          })
-          .catch(() => {
+          }})
+          .catch(() => {{
             document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
-          });
-        }
+          }});
+        }}
       </script>
     </body></html>
     """
 
 
-@app.route("/auth/consume", methods=["POST"])
+@app.post("/auth/consume")
 def auth_consume():
     """
     One-time token consumption endpoint.
     We do NOT store Supabase tokens. We only store user_email/user_id in Flask session.
     """
     data = request.get_json(silent=True) or {}
-    access_token = data.get("access_token")
+    access_token = (data.get("access_token") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
+
+    # Basic nonce check to reduce CSRF / random posts
+    expected = session.get("consume_nonce")
+    session.pop("consume_nonce", None)
+    if not expected or nonce != expected:
+        return {"ok": False}, 400
+
     if not access_token:
         return {"ok": False}, 400
 
     try:
         user = supabase_get_user(access_token)
     except Exception:
+        app.logger.exception("Supabase /user failed during consume")
         return {"ok": False}, 401
 
     email = (user.get("email") or "").strip().lower()
@@ -212,7 +257,7 @@ def auth_consume():
     return {"ok": True}, 200
 
 
-@app.route("/dashboard", methods=["GET"])
+@app.get("/dashboard")
 def dashboard():
     gate = require_login()
     if gate:
@@ -236,15 +281,20 @@ def dashboard():
     """
 
 
-@app.route("/logout", methods=["GET"])
+@app.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
 
-@app.route("/healthz", methods=["GET"])
+@app.get("/healthz")
 def healthz():
     return {"ok": True}, 200
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 if __name__ == "__main__":
