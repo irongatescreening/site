@@ -11,9 +11,9 @@ app = Flask(__name__)
 # -------------------------
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
+SUPABASE_ANON_KEY = (os.environ.get("SUPABASE_ANON_KEY") or "").strip()
 SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com").rstrip("/")
-AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
+AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").strip()
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
 missing = []
@@ -31,9 +31,9 @@ if missing:
 # -------------------------
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,     # HTTPS only (good for Render/prod)
+    SESSION_COOKIE_HTTPONLY=True,   # JS can't read
+    SESSION_COOKIE_SAMESITE="Lax",  # CSRF mitigation baseline
 )
 
 # Invite-only allowlist
@@ -91,6 +91,11 @@ def home():
 
 @app.get("/login")
 def login():
+    # If already logged in, go straight to dashboard
+    if session.get("user_email"):
+        return redirect(url_for("dashboard"))
+
+    # Create one-time nonce for token consumption
     nonce = secrets.token_urlsafe(32)
     session["consume_nonce"] = nonce
 
@@ -133,6 +138,7 @@ def login():
 def login_post():
     email = (request.form.get("email") or "").strip().lower()
 
+    # Invite-only gate (avoid email enumeration)
     if not is_allowed_email(email):
         time.sleep(1)
         return "<h3>If that email is authorized, you’ll receive a sign-in link shortly.</h3>", 200
@@ -143,7 +149,7 @@ def login_post():
         app.logger.exception("Supabase OTP send failed")
         return "<h3>Could not send login link. Try again.</h3>", 500
 
-    return "<h3>Check your email for your secure login link.</h3>"
+    return "<h3>Check your email for your secure login link.</h3>", 200
 
 
 @app.post("/auth/consume")
@@ -155,6 +161,9 @@ def auth_consume():
     expected = session.get("consume_nonce")
     session.pop("consume_nonce", None)
     if not expected or nonce != expected:
+        return {"ok": False}, 400
+
+    if not access_token:
         return {"ok": False}, 400
 
     try:
@@ -179,10 +188,19 @@ def dashboard():
     if gate:
         return gate
 
-    email = session.get("user_email")
+    email = session.get("user_email") or ""
+
     return f"""
     <h2>IGS Portal</h2>
-    <p>Signed in as <b>{email}</b></p>
+    <p>Signed in as: <b>{email}</b></p>
+
+    <h3>Status</h3>
+    <ul>
+      <li>John Doe — Invitation sent</li>
+      <li>Jane Smith — In progress</li>
+      <li>Dan Smith — Complete — <a href="#" onclick="alert('Later: deep link to Certn'); return false;">View report</a></li>
+    </ul>
+
     <p><a href="/logout">Logout</a></p>
     """
 
