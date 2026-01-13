@@ -52,7 +52,7 @@ app.config.update(
 )
 
 # -------------------------------------------------
-# Rate limiting (MUST exist before any @limiter.* decorators)
+# Rate limiting
 # -------------------------------------------------
 limiter = Limiter(
     app=app,
@@ -62,30 +62,29 @@ limiter = Limiter(
 )
 
 # -------------------------------------------------
-# Security headers
-# -------------------------------------------------
-Talisman(
-    app,
-    force_https=True,
-    strict_transport_security=True,
-)
-
-# -------------------------------------------------
-# Health checks (NO @limiter decorators here)
+# Health checks (NO decorators here)
 # -------------------------------------------------
 @app.get("/health")
 def health():
     return "ok", 200
 
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True}, 200
 
-
-# Exempt AFTER limiter exists (this avoids NameError)
+# -------------------------------------------------
+# Exempt AFTER limiter exists (avoids NameError)
+# -------------------------------------------------
 limiter.exempt(health)
 limiter.exempt(healthz)
+
+# -------------------------------------------------
+# Never rate-limit health checks (belt + suspenders)
+# -------------------------------------------------
+@limiter.request_filter
+def _skip_limiter_for_health():
+    return request.path in ("/health", "/healthz")
+
 
 # -------------------------------------------------
 # Allowlist helpers
