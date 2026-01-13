@@ -360,6 +360,20 @@ def auth_consume():
 @app.post("/webhooks/certn")
 @limiter.limit("60 per minute")
 def certn_webhook():
+    raw = request.get_data(cache=False)
+
+    # 👇 PUT IT RIGHT HERE
+    app.logger.info(
+        "Certn webhook hit. headers=%s",
+        list(request.headers.keys())
+    )
+
+    sig = request.headers.get("Certn-Signature")
+
+    if not _verify_certn_signature(raw, sig):
+        app.logger.warning("Certn webhook signature verification failed")
+        return {"ok": False}, 401
+
     """
     Webhook endpoint stub:
     - verifies signature (HMAC placeholder)
