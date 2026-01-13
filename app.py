@@ -215,18 +215,31 @@ def _verify_certn_signature(raw_body: bytes, signature_header: str | None) -> bo
     if not signature_header:
         return False
 
-    sig = signature_header.strip()
-    # Accept either "sha256=<hex>" or just "<hex>"
-    if sig.startswith("sha256="):
-        sig = sig.split("=", 1)[1].strip()
+    # Expected format: "t=1700000000,v1=<hex>[,v1=<hex>...]"
+    parts = [p.strip() for p in signature_header.split(",")]
+    timestamp = None
+    sigs = []
+
+    for p in parts:
+        if p.startswith("t="):
+            timestamp = p.split("=", 1)[1]
+        elif p.startswith("v1="):
+            sigs.append(p.split("=", 1)[1])
+
+    if not timestamp or not sigs:
+        return False
+
+    # Build signed payload: f"{t}.{raw_body}"
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
 
     expected = hmac.new(
         CERTN_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
+        signed_payload,
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(sig, expected)
+    return any(hmac.compare_digest(expected, s) for s in sigs)
+
 
 
 # -------------------------
@@ -354,7 +367,7 @@ def certn_webhook():
     - stores check_id/status/report_url into SQLite
     """
     raw = request.get_data(cache=False)
-    sig = request.headers.get("X-Certn-Signature")
+    sig = request.headers.get("Certn-Signature")
 
     if not _verify_certn_signature(raw, sig):
         app.logger.warning("Certn webhook signature verification failed")
