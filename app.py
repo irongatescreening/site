@@ -31,8 +31,15 @@ ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 CERTN_WEBHOOK_SECRET = os.environ.get("CERTN_WEBHOOK_SECRET") or ""
 DB_PATH = os.environ.get("DB_PATH") or "/opt/render/project/src/instance/igs.db"
 
-if not FLASK_SECRET_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Missing required environment variables")
+missing = []
+if not FLASK_SECRET_KEY:
+    missing.append("FLASK_SECRET_KEY")
+if not SUPABASE_URL:
+    missing.append("SUPABASE_URL")
+if not SUPABASE_ANON_KEY:
+    missing.append("SUPABASE_ANON_KEY")
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 # -------------------------------------------------
 # Flask config
@@ -45,7 +52,7 @@ app.config.update(
 )
 
 # -------------------------------------------------
-# Rate limiting
+# Rate limiting (MUST exist before any @limiter.* decorators)
 # -------------------------------------------------
 limiter = Limiter(
     app=app,
@@ -64,17 +71,19 @@ Talisman(
 )
 
 # -------------------------------------------------
-# Health checks (NO decorators here)
+# Health checks (NO @limiter decorators here)
 # -------------------------------------------------
-@app.route("/health")
+@app.get("/health")
 def health():
     return "ok", 200
 
-@app.route("/healthz")
+
+@app.get("/healthz")
 def healthz():
     return {"ok": True}, 200
 
-# Exempt AFTER limiter exists
+
+# Exempt AFTER limiter exists (this avoids NameError)
 limiter.exempt(health)
 limiter.exempt(healthz)
 
@@ -83,8 +92,12 @@ limiter.exempt(healthz)
 # -------------------------------------------------
 ALLOWLIST = {e.strip().lower() for e in ALLOWLIST_EMAILS.split(",") if e.strip()}
 
+
 def is_allowed_email(email: str) -> bool:
-    return email and email.lower() in ALLOWLIST
+    if not email:
+        return False
+    return email.strip().lower() in ALLOWLIST
+
 
 # -------------------------------------------------
 # Supabase helpers
@@ -103,7 +116,9 @@ def supabase_send_magic_link(email: str) -> None:
     }
     r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code not in (200, 201):
+        app.logger.error("Supabase OTP failed: %s %s", r.status_code, r.text)
         raise RuntimeError("Supabase OTP failed")
+
 
 def supabase_get_user(access_token: str) -> dict:
     url = f"{SUPABASE_URL}/auth/v1/user"
@@ -113,8 +128,16 @@ def supabase_get_user(access_token: str) -> dict:
     }
     r = requests.get(url, headers=headers, timeout=15)
     if r.status_code != 200:
+        app.logger.error("Supabase /user failed: %s %s", r.status_code, r.text)
         raise RuntimeError("Supabase /user failed")
     return r.json()
+
+
+def require_login():
+    if not session.get("user_email"):
+        return redirect(url_for("login"))
+    return None
+
 
 # -------------------------------------------------
 # Database helpers
@@ -122,7 +145,8 @@ def supabase_get_user(access_token: str) -> dict:
 def _ensure_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS certn_checks (
                 check_id TEXT PRIMARY KEY,
                 client_email TEXT,
@@ -130,14 +154,17 @@ def _ensure_db():
                 updated_at TEXT NOT NULL,
                 report_url TEXT
             )
-        """)
+            """
+        )
         conn.commit()
 
-def _upsert_check(check_id, client_email, status, report_url):
+
+def _upsert_check(check_id: str, client_email: str | None, status: str, report_url: str | None):
     _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO certn_checks (check_id, client_email, status, updated_at, report_url)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(check_id) DO UPDATE SET
@@ -145,107 +172,217 @@ def _upsert_check(check_id, client_email, status, report_url):
                 status=excluded.status,
                 updated_at=excluded.updated_at,
                 report_url=excluded.report_url
-        """, (check_id, client_email, status, now, report_url))
+            """,
+            (str(check_id), client_email, str(status), now, report_url),
+        )
         conn.commit()
+
 
 # -------------------------------------------------
 # Webhook verification
+# NOTE: Header name is UNKNOWN. Keep it configurable.
+# Put the real header name in CERTN_SIGNATURE_HEADER env var later.
 # -------------------------------------------------
-def verify_certn_signature(raw_body, header):
-    if not CERTN_WEBHOOK_SECRET or not header:
+CERTN_SIGNATURE_HEADER = os.environ.get("CERTN_SIGNATURE_HEADER") or "X-Certn-Signature"
+
+
+def verify_certn_signature(raw_body: bytes, header_value: str | None) -> bool:
+    if not CERTN_WEBHOOK_SECRET or not header_value:
         return False
 
-    parts = header.split(",")
-    timestamp = None
-    sigs = []
+    # Supports either:
+    # 1) "sha256=<hex>"
+    # 2) "<hex>"
+    # 3) Stripe-style: "t=...,v1=...,v1=..."
+    hv = header_value.strip()
 
-    for p in parts:
-        if p.startswith("t="):
-            timestamp = p.split("=", 1)[1]
-        elif p.startswith("v1="):
-            sigs.append(p.split("=", 1)[1])
+    # Stripe-style parsing (t=, v1=)
+    if "t=" in hv and "v1=" in hv:
+        parts = [p.strip() for p in hv.split(",") if p.strip()]
+        timestamp = None
+        sigs = []
+        for p in parts:
+            if p.startswith("t="):
+                timestamp = p.split("=", 1)[1].strip()
+            elif p.startswith("v1="):
+                sigs.append(p.split("=", 1)[1].strip())
 
-    if not timestamp or not sigs:
-        return False
+        if not timestamp or not sigs:
+            return False
 
-    signed = timestamp.encode() + b"." + raw_body
+        signed = timestamp.encode("utf-8") + b"." + raw_body
+        expected = hmac.new(
+            CERTN_WEBHOOK_SECRET.encode("utf-8"),
+            signed,
+            hashlib.sha256,
+        ).hexdigest()
+
+        return any(hmac.compare_digest(expected, s) for s in sigs)
+
+    # Simple sha256=<hex> or <hex>
+    if hv.startswith("sha256="):
+        hv = hv.split("=", 1)[1].strip()
+
     expected = hmac.new(
-        CERTN_WEBHOOK_SECRET.encode(),
-        signed,
+        CERTN_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
         hashlib.sha256,
     ).hexdigest()
 
-    return any(hmac.compare_digest(expected, s) for s in sigs)
+    return hmac.compare_digest(expected, hv)
+
 
 # -------------------------------------------------
 # Routes
 # -------------------------------------------------
 @app.get("/")
 def home():
+    if session.get("user_email"):
+        return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
+
 
 @app.get("/login")
 def login():
+    # If already logged in, go straight to dashboard
+    if session.get("user_email"):
+        return redirect(url_for("dashboard"))
+
     nonce = secrets.token_urlsafe(32)
-    session["nonce"] = nonce
+    session["consume_nonce"] = nonce
+
     return f"""
-    <script>
-      const f = new URLSearchParams(window.location.hash.slice(1));
-      const t = f.get("access_token");
-      if (t) {{
-        fetch("/auth/consume", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ access_token: t, nonce: "{nonce}" }})
-        }}).then(() => location.href="/dashboard");
-      }}
-    </script>
-    <form method="POST">
-      <input name="email" type="email" required />
-      <button>Send login link</button>
-    </form>
+    <html>
+    <body>
+      <script>
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const access_token = fragment.get('access_token');
+
+        if (access_token) {{
+          fetch('/auth/consume', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ access_token: access_token, nonce: '{nonce}' }})
+          }})
+          .then(res => {{
+            if (!res.ok) throw new Error('auth failed');
+            history.replaceState(null, "", "/login");
+            window.location.replace('/dashboard');
+          }})
+          .catch(() => {{
+            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+          }});
+        }}
+      </script>
+
+      <h2>IGS Portal Login</h2>
+      <p>Enter your email to receive a secure sign-in link.</p>
+      <form method="POST" action="/login">
+        <input name="email" type="email" placeholder="you@company.com" required />
+        <button type="submit">Send login link</button>
+      </form>
+    </body>
+    </html>
     """
+
 
 @app.post("/login")
 @limiter.limit("8 per 15 minutes")
 def login_post():
-    email = (request.form.get("email") or "").lower()
-    if is_allowed_email(email):
-        supabase_send_magic_link(email)
+    email = (request.form.get("email") or "").strip().lower()
+
+    allowed = is_allowed_email(email)
+    if allowed:
+        try:
+            supabase_send_magic_link(email)
+        except Exception:
+            app.logger.exception("Supabase OTP send failed")
+
     time.sleep(1)
-    return "Check your email", 200
+    return """
+    <h3>Check your email</h3>
+    <p>If your email is authorized, you’ll receive a secure login link shortly.</p>
+    """, 200
+
 
 @app.post("/auth/consume")
+@limiter.limit("30 per minute")
 def auth_consume():
-    data = request.get_json() or {}
-    if data.get("nonce") != session.pop("nonce", None):
-        return {"ok": False}, 400
-    user = supabase_get_user(data.get("access_token"))
-    if not is_allowed_email(user.get("email")):
-        return {"ok": False}, 403
-    session["user_email"] = user["email"]
-    return {"ok": True}
+    data = request.get_json(silent=True) or {}
+    access_token = (data.get("access_token") or "").strip()
+    nonce = (data.get("nonce") or "").strip()
 
-@app.post("/webhooks/certn")
-def certn_webhook():
-    raw = request.get_data()
-    app.logger.info("Certn webhook hit")
-    if not verify_certn_signature(raw, request.headers.get("Certn-Signature")):
+    expected = session.get("consume_nonce")
+    session.pop("consume_nonce", None)
+
+    if not expected or not secrets.compare_digest(nonce, expected):
+        return {"ok": False}, 400
+
+    if not access_token:
+        return {"ok": False}, 400
+
+    try:
+        user = supabase_get_user(access_token)
+    except Exception:
+        app.logger.exception("Supabase /user failed during consume")
         return {"ok": False}, 401
 
-    payload = json.loads(raw.decode())
-    check_id = payload.get("id") or payload.get("check_id")
-    status = payload.get("status", "unknown")
-    _upsert_check(check_id, None, status, None)
-    return {"ok": True}
+    email = (user.get("email") or "").strip().lower()
+    if not is_allowed_email(email):
+        session.clear()
+        return {"ok": False}, 403
+
+    session.clear()
+    session["user_email"] = email
+    session["user_id"] = user.get("id")
+    return {"ok": True}, 200
+
+
+@app.post("/webhooks/certn")
+@limiter.limit("60 per minute")
+def certn_webhook():
+    raw = request.get_data(cache=False)
+
+    # Debug line you asked for (safe: logs only header keys, not values)
+    app.logger.info("Certn webhook hit. headers=%s", list(request.headers.keys()))
+
+    sig_value = request.headers.get(CERTN_SIGNATURE_HEADER)
+
+    if not verify_certn_signature(raw, sig_value):
+        app.logger.warning("Certn webhook signature verification failed")
+        return {"ok": False}, 401
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        app.logger.exception("Certn webhook invalid JSON")
+        return {"ok": False}, 400
+
+    check_id = payload.get("check_id") or payload.get("checkId") or payload.get("id")
+    status = payload.get("status") or payload.get("state") or "unknown"
+
+    if not check_id:
+        app.logger.warning("Webhook missing check_id. keys=%s", list(payload.keys()))
+        return {"ok": False, "error": "missing check_id"}, 400
+
+    # Minimal for now (data flow first)
+    _upsert_check(str(check_id), None, str(status), None)
+    return {"ok": True}, 200
+
 
 @app.get("/dashboard")
 def dashboard():
-    if not session.get("user_email"):
-        return redirect(url_for("login"))
-    return f"Logged in as {session['user_email']}"
+    gate = require_login()
+    if gate:
+        return gate
+    return f"Logged in as {session.get('user_email')}"
+
 
 @app.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
