@@ -17,9 +17,14 @@ from flask_talisman import Talisman
 app = Flask(__name__)
 
 @app.route("/health")
+@limiter.exempt
 def health():
     return "ok", 200
 
+@app.get("/healthz")
+@limiter.exempt
+def healthz():
+    return {"ok": True}, 200
 
 # -------------------------
 # REQUIRED ENV VARS (Render)
