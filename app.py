@@ -77,6 +77,15 @@ limiter = Limiter(
     default_limits=["300 per day", "60 per hour"],
     storage_uri="memory://",
 )
+@app.route("/health")
+@limiter.exempt
+def health():
+    return "ok", 200
+
+@app.get("/healthz")
+@limiter.exempt
+def healthz():
+    return {"ok": True}, 200
 
 # -------------------------
 # Security headers (Talisman)
