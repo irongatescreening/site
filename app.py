@@ -1,24 +1,18 @@
-# app.py — Iron Gate Screening Portal (MVP)
-# Goals right now:
-# 1) App boots cleanly on Render
-# 2) /healthz never rate-limited (no 429 spam)
-# 3) /webhooks/certn logs hits (plumbing test)
-# 4) Magic-link login flow stays intact
-
 import os
 import time
 import json
 import secrets
 import sqlite3
+import hmac
+import hashlib
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, request, session, redirect, url_for, jsonify
+from flask import Flask, request, session, redirect, url_for
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
-
 
 
 # -------------------------------------------------
@@ -28,7 +22,7 @@ app = Flask(__name__)
 
 
 # -------------------------------------------------
-# Environment variables (Render)
+# Environment variables
 # -------------------------------------------------
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or ""
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
@@ -37,20 +31,14 @@ SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com"
 AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
 
-# Webhook + DB (we'll tighten later)
 CERTN_WEBHOOK_SECRET = os.environ.get("CERTN_WEBHOOK_SECRET") or ""
+CERTN_SIGNATURE_HEADER = os.environ.get("CERTN_SIGNATURE_HEADER") or "Certn-Signature"
+CERTN_VERIFY_ENABLED = (os.environ.get("CERTN_VERIFY_ENABLED") or "true").lower() == "true"
+
 DB_PATH = os.environ.get("DB_PATH") or "/opt/render/project/src/instance/igs.db"
 
-# Fail fast so deploy errors are obvious
-missing = []
-if not FLASK_SECRET_KEY:
-    missing.append("FLASK_SECRET_KEY")
-if not SUPABASE_URL:
-    missing.append("SUPABASE_URL")
-if not SUPABASE_ANON_KEY:
-    missing.append("SUPABASE_ANON_KEY")
-if missing:
-    raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+if not FLASK_SECRET_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("Missing required environment variables: FLASK_SECRET_KEY, SUPABASE_URL, SUPABASE_ANON_KEY")
 
 
 # -------------------------------------------------
@@ -61,18 +49,6 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-)
-
-
-# -------------------------------------------------
-# Security headers
-# -------------------------------------------------
-# Note: if you are behind Cloudflare/Render, force_https=True is still ok,
-# but if it ever causes redirect loops, set force_https=False temporarily.
-Talisman(
-    app,
-    force_https=True,
-    strict_transport_security=True,
 )
 
 
@@ -93,7 +69,17 @@ def _skip_limiter_for_health():
 
 
 # -------------------------------------------------
-# Health checks (Render will call these repeatedly)
+# Security headers
+# -------------------------------------------------
+Talisman(
+    app,
+    force_https=True,
+    strict_transport_security=True,
+)
+
+
+# -------------------------------------------------
+# Health checks (Render uses /healthz)
 # -------------------------------------------------
 @app.get("/health")
 def health():
@@ -105,20 +91,13 @@ def healthz():
     return {"ok": True}, 200
 
 
-# Also explicitly exempt (in case defaults change)
-limiter.exempt(health)
-limiter.exempt(healthz)
-
-
 # -------------------------------------------------
 # Allowlist helpers
 # -------------------------------------------------
 ALLOWLIST = {e.strip().lower() for e in ALLOWLIST_EMAILS.split(",") if e.strip()}
 
 def is_allowed_email(email: str) -> bool:
-    if not email:
-        return False
-    return email.strip().lower() in ALLOWLIST
+    return bool(email) and email.strip().lower() in ALLOWLIST
 
 
 # -------------------------------------------------
@@ -156,44 +135,99 @@ def supabase_get_user(access_token: str) -> dict:
 
 
 # -------------------------------------------------
-# DB helpers (minimal; ok for now)
+# Database helpers
 # -------------------------------------------------
 def _ensure_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS certn_checks (
                 check_id TEXT PRIMARY KEY,
                 client_email TEXT,
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                report_url TEXT
+                report_url TEXT,
+                raw_json TEXT
             )
-            """
-        )
+        """)
         conn.commit()
 
 
-def _upsert_check(check_id: str, client_email: str | None, status: str, report_url: str | None):
+def _upsert_check(check_id: str, client_email: str | None, status: str, report_url: str | None, raw_json: str | None):
     if not check_id:
-        return
+        raise ValueError("Missing check_id")
     _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
+
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO certn_checks (check_id, client_email, status, updated_at, report_url)
-            VALUES (?, ?, ?, ?, ?)
+        conn.execute("""
+            INSERT INTO certn_checks (check_id, client_email, status, updated_at, report_url, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(check_id) DO UPDATE SET
                 client_email=excluded.client_email,
                 status=excluded.status,
                 updated_at=excluded.updated_at,
-                report_url=excluded.report_url
-            """,
-            (check_id, client_email, status, now, report_url),
-        )
+                report_url=excluded.report_url,
+                raw_json=excluded.raw_json
+        """, (check_id, client_email, status, now, report_url, raw_json))
         conn.commit()
+
+
+def _recent_checks(limit: int = 25):
+    _ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            SELECT check_id, client_email, status, updated_at, report_url
+            FROM certn_checks
+            ORDER BY updated_at DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+
+    return [
+        {"check_id": r[0], "client_email": r[1], "status": r[2], "updated_at": r[3], "report_url": r[4]}
+        for r in rows
+    ]
+
+
+# -------------------------------------------------
+# Webhook signature verification
+# -------------------------------------------------
+def verify_certn_signature(raw_body: bytes, header_value: str | None) -> bool:
+    """
+    Expected header format (Stripe-style):
+      t=timestamp,v1=hexsig[,v1=hexsig2...]
+
+    Signed payload:
+      <timestamp>.<raw_body>
+    HMAC SHA256 with CERTN_WEBHOOK_SECRET
+    """
+    if not CERTN_WEBHOOK_SECRET:
+        return False
+    if not header_value:
+        return False
+
+    parts = [p.strip() for p in header_value.split(",")]
+    timestamp = None
+    sigs: list[str] = []
+
+    for p in parts:
+        if p.startswith("t="):
+            timestamp = p.split("=", 1)[1]
+        elif p.startswith("v1="):
+            sigs.append(p.split("=", 1)[1])
+
+    if not timestamp or not sigs:
+        return False
+
+    signed = timestamp.encode("utf-8") + b"." + raw_body
+    expected = hmac.new(
+        CERTN_WEBHOOK_SECRET.encode("utf-8"),
+        signed,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return any(hmac.compare_digest(expected, s) for s in sigs)
 
 
 # -------------------------------------------------
@@ -221,7 +255,7 @@ def login():
       }}
     </script>
     <form method="POST">
-      <input name="email" type="email" required placeholder="you@company.com" />
+      <input name="email" type="email" required />
       <button>Send login link</button>
     </form>
     """
@@ -233,7 +267,6 @@ def login_post():
     email = (request.form.get("email") or "").strip().lower()
     if is_allowed_email(email):
         supabase_send_magic_link(email)
-    # Always respond the same (prevents allowlist enumeration)
     time.sleep(1)
     return "Check your email", 200
 
@@ -242,14 +275,13 @@ def login_post():
 def auth_consume():
     data = request.get_json(silent=True) or {}
     if data.get("nonce") != session.pop("nonce", None):
-        return {"ok": False}, 400
+        return {"ok": False, "error": "bad_nonce"}, 400
 
-    access_token = data.get("access_token") or ""
-    user = supabase_get_user(access_token)
-    email = (user.get("email") or "").lower()
+    user = supabase_get_user(data.get("access_token") or "")
+    email = (user.get("email") or "").strip().lower()
 
     if not is_allowed_email(email):
-        return {"ok": False}, 403
+        return {"ok": False, "error": "forbidden"}, 403
 
     session["user_email"] = email
     return {"ok": True}, 200
@@ -269,33 +301,73 @@ def logout():
 
 
 # -------------------------------------------------
-# CERTN webhook (TEMP: plumbing test, no signature enforcement)
+# Debug endpoint to confirm DB writes (optional)
+# -------------------------------------------------
+@app.get("/debug/checks")
+def debug_checks():
+    # If you want to lock this down later, we can require session.
+    return {"ok": True, "checks": _recent_checks(25)}, 200
+
+
+# -------------------------------------------------
+# Certn webhook (LOG KEYS + VERIFY + UPSERT)
 # -------------------------------------------------
 @app.post("/webhooks/certn")
 def certn_webhook():
-    raw = request.get_data()
+    raw = request.get_data() or b""
 
+    # Parse JSON safely
+    try:
+        payload = request.get_json(force=True, silent=False)  # will throw if invalid
+    except Exception as e:
+        app.logger.warning("Certn webhook invalid JSON: err=%s body_len=%s", str(e), len(raw))
+        return {"ok": False, "error": "invalid_json"}, 400
+
+    # ✅ 1) Log keys (exactly what you requested)
+    keys = sorted(list(payload.keys())) if isinstance(payload, dict) else []
     app.logger.info(
-        "CERTN WEBHOOK HIT: path=%s ip=%s ua=%s content_type=%s headers=%s body_len=%s",
+        "CERTN WEBHOOK HIT: path=%s ip=%s ua=%s header=%s verify=%s keys=%s body_len=%s",
         request.path,
         request.headers.get("X-Forwarded-For", request.remote_addr),
         request.headers.get("User-Agent"),
-        request.headers.get("Content-Type"),
-        list(request.headers.keys()),
+        CERTN_SIGNATURE_HEADER,
+        CERTN_VERIFY_ENABLED,
+        keys,
         len(raw),
     )
 
-    # Try to parse JSON if present; don't fail if it's not JSON yet
-    payload = None
-    try:
-        payload = request.get_json(silent=True)
-    except Exception:
-        payload = None
+    # ✅ 2) Re-enable signature verification
+    if CERTN_VERIFY_ENABLED:
+        sig_header_val = request.headers.get(CERTN_SIGNATURE_HEADER)
+        if not verify_certn_signature(raw, sig_header_val):
+            app.logger.warning(
+                "Certn webhook signature FAILED: header_present=%s",
+                bool(sig_header_val),
+            )
+            return {"ok": False, "error": "bad_signature"}, 401
 
-    # If payload has a check id + status, store it (safe/no-op if missing)
+    # ✅ 3) Insert webhook data into SQLite
+    check_id = None
+    status = "unknown"
+    report_url = None
+    client_email = None
+
     if isinstance(payload, dict):
-        check_id = payload.get("id") or payload.get("check_id") or ""
-        status = payload.get("status") or "unknown"
-        _upsert_check(check_id, None, status, None)
+        check_id = payload.get("id") or payload.get("check_id") or payload.get("case_id")
+        status = payload.get("status") or payload.get("state") or "unknown"
+        report_url = payload.get("report_url") or payload.get("reportLink") or payload.get("report")
+        client_email = payload.get("client_email") or payload.get("email")
+
+    try:
+        _upsert_check(
+            check_id=str(check_id) if check_id else "",
+            client_email=client_email,
+            status=str(status),
+            report_url=str(report_url) if report_url else None,
+            raw_json=json.dumps(payload)[:100000],  # keep it bounded
+        )
+    except Exception as e:
+        app.logger.exception("DB upsert failed: err=%s", str(e))
+        return {"ok": False, "error": "db_write_failed"}, 500
 
     return {"ok": True}, 200
