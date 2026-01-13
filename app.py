@@ -16,6 +16,11 @@ from flask_talisman import Talisman
 
 app = Flask(__name__)
 
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
 # -------------------------
 # REQUIRED ENV VARS (Render)
 # -------------------------
