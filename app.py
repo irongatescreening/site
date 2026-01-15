@@ -114,17 +114,6 @@ def healthz():
 limiter.exempt(health)
 limiter.exempt(healthz)
 
-@app.get("/debug/test-insert")
-def test_insert():
-    _upsert_check(
-        check_id="test-check-001",
-        status="IN_PROGRESS",
-        client_email="tyler@irongatescreening.com",
-        report_url=None
-    )
-    return {"ok": True}
-
-
 # -------------------------
 # Allowlist helpers
 # -------------------------
