@@ -442,6 +442,16 @@ def sync_certn_cases(max_pages: int = 5, page_size: int = 100) -> dict:
 # -------------------------
 # Routes
 # -------------------------
+@app.get("/auth/callback")
+def auth_callback():
+    """
+    Supabase redirect target.
+    Supabase may return tokens in the URL fragment (#access_token=...),
+    which the server can't read. We forward to /login so the existing
+    JS fragment handler runs.
+    """
+    return redirect(url_for("login"))
+
 @app.get("/")
 def home():
     if session.get("user_email"):
