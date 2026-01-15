@@ -671,6 +671,7 @@ def debug_last_webhook():
 # TESTING: Secure test endpoint (requires CRON_TOKEN)
 # -------------------------
 @app.post("/jobs/test-insert")
+@csrf.exempt
 @limiter.limit("10 per minute")
 def job_test_insert():
     """
@@ -694,6 +695,7 @@ def job_test_insert():
 # -------------------------
 @app.post("/jobs/sync-certn")
 @limiter.limit("2 per minute")
+@csrf.exempt
 def job_sync_certn():
     """
     SECURITY: Protected cron job endpoint.
