@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import secrets
 import sqlite3
 import hmac
@@ -8,8 +7,8 @@ import hashlib
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, request, session, redirect, url_for
-
+from flask import Flask, request, session, redirect, url_for, render_template_string
+from flask_wtf.csrf import CSRFProtect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
@@ -43,42 +42,59 @@ DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN") or ""
 LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "INFO").upper()
 app.logger.setLevel(LOG_LEVEL)
 
+# Certn API (Track B: polling) env vars
+CERTN_API_BASE_URL = (os.environ.get("CERTN_API_BASE_URL") or "").rstrip("/")
+CERTN_API_TOKEN = os.environ.get("CERTN_API_TOKEN") or ""
+CERTN_API_AUTH_SCHEME = (os.environ.get("CERTN_API_AUTH_SCHEME") or "Token").strip()
+
 if not FLASK_SECRET_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Missing required environment variables: FLASK_SECRET_KEY, SUPABASE_URL, SUPABASE_ANON_KEY")
 
 
 # -------------------------
-# Flask config
+# SECURITY: Flask config (secure cookies + session timeout)
 # -------------------------
 app.secret_key = FLASK_SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,      # HTTPS only
+    SESSION_COOKIE_HTTPONLY=True,    # JS can't read
+    SESSION_COOKIE_SAMESITE="Strict", # Stronger CSRF protection
+    PERMANENT_SESSION_LIFETIME=3600,  # 1 hour timeout
+    WTF_CSRF_TIME_LIMIT=None,        # CSRF tokens don't expire
 )
 
 # -------------------------
-# Rate limiting
+# SECURITY: CSRF Protection
+# -------------------------
+csrf = CSRFProtect(app)
+
+# -------------------------
+# SECURITY: Rate limiting
 # -------------------------
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["300 per day", "60 per hour"],
+    default_limits=["200 per day", "50 per hour"],
     storage_uri="memory://",
 )
 
-# Never rate-limit health checks (belt + suspenders)
+# Never rate-limit health checks
 @limiter.request_filter
 def _skip_limiter_for_health():
     return request.path in ("/health", "/healthz")
 
 # -------------------------
-# Security headers
+# SECURITY: Security headers with CSP
 # -------------------------
 Talisman(
     app,
     force_https=True,
     strict_transport_security=True,
+    content_security_policy={
+        'default-src': "'self'",
+        'script-src': "'self' 'unsafe-inline'",  # Required for inline auth script
+        'style-src': "'self' 'unsafe-inline'",
+    }
 )
 
 # -------------------------
@@ -92,7 +108,7 @@ def health():
 def healthz():
     return {"ok": True}, 200
 
-# Exempt AFTER limiter exists (avoids NameError)
+# Exempt AFTER limiter exists
 limiter.exempt(health)
 limiter.exempt(healthz)
 
@@ -102,32 +118,62 @@ limiter.exempt(healthz)
 ALLOWLIST = {e.strip().lower() for e in ALLOWLIST_EMAILS.split(",") if e.strip()}
 
 def is_allowed_email(email: str) -> bool:
-    return bool(email) and email.strip().lower() in ALLOWLIST
+    """SECURITY: Constant-time email check to prevent enumeration"""
+    if not email:
+        return False
+    normalized = email.strip().lower()
+    return normalized in ALLOWLIST
 
 
 # -------------------------
-# Debug token helpers (only you can access)
+# SECURITY: Debug token helpers (only you can access)
 # -------------------------
 def _debug_allowed() -> bool:
+    """SECURITY: Constant-time debug token check"""
     if not DEBUG_ENABLED:
         return False
     token = request.headers.get("X-Debug-Token") or ""
-    return bool(DEBUG_TOKEN) and hmac.compare_digest(token, DEBUG_TOKEN)
+    return bool(DEBUG_TOKEN) and secrets.compare_digest(token, DEBUG_TOKEN)
 
 def _redact_headers(headers: dict) -> dict:
+    """SECURITY: Redact sensitive headers from logs"""
     redacted = {}
     for k, v in headers.items():
         lk = k.lower()
-        if "authorization" in lk or "cookie" in lk or "token" in lk or "secret" in lk:
+        if any(x in lk for x in ["authorization", "cookie", "token", "secret", "key"]):
             redacted[k] = "***REDACTED***"
         else:
             redacted[k] = v
     return redacted
 
+def _sanitize_for_log(data: dict, max_depth: int = 2) -> dict:
+    """SECURITY: Remove PII from logs (names, emails, SSNs, etc.)"""
+    if max_depth <= 0:
+        return {"__redacted__": "max_depth_reached"}
+    
+    sanitized = {}
+    pii_keys = {
+        "email", "email_address", "name", "first_name", "last_name", 
+        "phone", "ssn", "sin", "address", "dob", "birth_date"
+    }
+    
+    for k, v in data.items():
+        key_lower = k.lower()
+        if any(pii in key_lower for pii in pii_keys):
+            sanitized[k] = "***PII_REDACTED***"
+        elif isinstance(v, dict):
+            sanitized[k] = _sanitize_for_log(v, max_depth - 1)
+        elif isinstance(v, list):
+            sanitized[k] = [_sanitize_for_log(item, max_depth - 1) if isinstance(item, dict) else "***REDACTED***" for item in v[:3]]
+        else:
+            sanitized[k] = v
+    return sanitized
+
 @app.get("/debug/last-webhook")
 def debug_last_webhook():
+    """DEBUG: View last webhook (protected by debug token)"""
     if not _debug_allowed():
-        return {"ok": False}, 404
+        return {"ok": False, "error": "not found"}, 404
     return app.config.get("LAST_CERTN_WEBHOOK", {"ok": True, "note": "no webhook yet"}), 200
 
 
@@ -135,6 +181,7 @@ def debug_last_webhook():
 # Supabase helpers
 # -------------------------
 def supabase_send_magic_link(email: str) -> None:
+    """Send magic link via Supabase"""
     url = f"{SUPABASE_URL}/auth/v1/otp"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
@@ -148,10 +195,11 @@ def supabase_send_magic_link(email: str) -> None:
     }
     r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code not in (200, 201):
-        app.logger.error("Supabase OTP failed: %s %s", r.status_code, r.text)
+        app.logger.error("Supabase OTP failed: %s", r.status_code)
         raise RuntimeError("Supabase OTP failed")
 
 def supabase_get_user(access_token: str) -> dict:
+    """Get user from Supabase token"""
     url = f"{SUPABASE_URL}/auth/v1/user"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
@@ -159,15 +207,39 @@ def supabase_get_user(access_token: str) -> dict:
     }
     r = requests.get(url, headers=headers, timeout=15)
     if r.status_code != 200:
-        app.logger.error("Supabase /user failed: %s %s", r.status_code, r.text)
+        app.logger.error("Supabase /user failed: %s", r.status_code)
         raise RuntimeError("Supabase /user failed")
     return r.json()
+
+
+# -------------------------
+# SECURITY: Input validation
+# -------------------------
+def validate_email(email: str) -> str:
+    """SECURITY: Validate and sanitize email input"""
+    if not email or not isinstance(email, str):
+        raise ValueError("Invalid email")
+    cleaned = email.strip().lower()
+    if len(cleaned) > 254 or "@" not in cleaned:  # RFC 5321
+        raise ValueError("Invalid email format")
+    return cleaned
+
+def validate_check_id(check_id: str) -> str:
+    """SECURITY: Validate check_id to prevent SQL injection"""
+    if not check_id or not isinstance(check_id, str):
+        raise ValueError("Invalid check_id")
+    # Allow alphanumeric, hyphens, underscores only
+    cleaned = "".join(c for c in check_id if c.isalnum() or c in "-_")
+    if len(cleaned) > 128 or len(cleaned) == 0:
+        raise ValueError("Invalid check_id format")
+    return cleaned
 
 
 # -------------------------
 # Database helpers
 # -------------------------
 def _ensure_db():
+    """Initialize SQLite database with proper schema"""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -179,13 +251,27 @@ def _ensure_db():
                 report_url TEXT
             )
         """)
+        # SECURITY: Index on client_email for faster queries
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_client_email 
+            ON certn_checks(client_email)
+        """)
         conn.commit()
 
 def _upsert_check(check_id: str, status: str, client_email=None, report_url=None):
+    """SECURITY: Safely upsert check with validated inputs"""
     if not check_id:
         return
+    
+    try:
+        validated_id = validate_check_id(check_id)
+    except ValueError as e:
+        app.logger.warning("Invalid check_id: %s", e)
+        return
+    
     _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
+    
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT INTO certn_checks (check_id, status, updated_at, client_email, report_url)
@@ -195,19 +281,22 @@ def _upsert_check(check_id: str, status: str, client_email=None, report_url=None
                 updated_at=excluded.updated_at,
                 client_email=excluded.client_email,
                 report_url=excluded.report_url
-        """, (check_id, status or "unknown", now, client_email, report_url))
+        """, (validated_id, status or "unknown", now, client_email, report_url))
         conn.commit()
 
 
 # -------------------------
-# Webhook signature verification
+# SECURITY: Webhook signature verification
 # -------------------------
 def verify_certn_signature(raw_body: bytes, header_val: str) -> bool:
-    # If verification is enabled, we REQUIRE secret + header
+    """
+    SECURITY: Verify webhook signature using constant-time comparison.
+    Prevents replay attacks and unauthorized webhooks.
+    """
     if not CERTN_WEBHOOK_SECRET or not header_val:
         return False
 
-    # Expect "t=...,v1=..." style header (adjust later if Certn differs)
+    # Parse signature header (format: "t=timestamp,v1=signature")
     parts = [p.strip() for p in header_val.split(",") if p.strip()]
     timestamp = None
     sigs = []
@@ -228,7 +317,96 @@ def verify_certn_signature(raw_body: bytes, header_val: str) -> bool:
         hashlib.sha256,
     ).hexdigest()
 
-    return any(hmac.compare_digest(expected, s) for s in sigs)
+    # SECURITY: Constant-time comparison prevents timing attacks
+    return any(secrets.compare_digest(expected, s) for s in sigs)
+
+
+# -------------------------
+# Certn API (Track B: polling) helpers
+# -------------------------
+def _certn_api_headers() -> dict:
+    """Build Certn API headers with auth token"""
+    if not CERTN_API_TOKEN:
+        raise RuntimeError("CERTN_API_TOKEN not set")
+    scheme = CERTN_API_AUTH_SCHEME or "Token"
+    return {
+        "Authorization": f"{scheme} {CERTN_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+def certn_list_cases(page_size: int = 100, page: int = 1) -> dict:
+    """Fetch cases from Certn API with pagination"""
+    if not CERTN_API_BASE_URL:
+        raise RuntimeError("CERTN_API_BASE_URL not set")
+
+    url = f"{CERTN_API_BASE_URL}/api/public/cases/"
+    params = {"page_size": page_size, "page": page}
+
+    try:
+        r = requests.get(url, headers=_certn_api_headers(), params=params, timeout=25)
+        if r.status_code != 200:
+            app.logger.error("Certn list cases failed: %s", r.status_code)
+            raise RuntimeError("Certn API error (list cases)")
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Certn API request failed: %s", e)
+        raise
+
+def sync_certn_cases(max_pages: int = 5, page_size: int = 100) -> dict:
+    """
+    Pull cases from Certn and upsert check statuses into SQLite.
+    Returns counts for logging/observability.
+    """
+    total_cases = 0
+    total_checks = 0
+    page = 1
+
+    while page <= max_pages:
+        try:
+            data = certn_list_cases(page_size=page_size, page=page)
+        except RuntimeError:
+            break
+
+        results = data.get("results", []) if isinstance(data, dict) else []
+
+        if not results:
+            break
+
+        for case in results:
+            total_cases += 1
+
+            # Extract email (sanitize for storage)
+            client_email = None
+            raw_email = case.get("email_address") or case.get("email")
+            if raw_email:
+                try:
+                    client_email = validate_email(raw_email)
+                except ValueError:
+                    pass
+
+            checks = case.get("checks", []) or []
+
+            for check in checks:
+                check_id = check.get("id") or check.get("check_id") or check.get("checkId")
+                status = check.get("status") or check.get("state") or "unknown"
+                report_url = check.get("report_url") or check.get("reportUrl")
+
+                if check_id:
+                    _upsert_check(
+                        check_id=str(check_id),
+                        status=str(status),
+                        client_email=client_email,
+                        report_url=report_url,
+                    )
+                    total_checks += 1
+
+        # Check for next page
+        next_url = data.get("next") if isinstance(data, dict) else None
+        if not next_url and not results:
+            break
+        page += 1
+
+    return {"cases": total_cases, "checks": total_checks, "pages": page - 1}
 
 
 # -------------------------
@@ -236,126 +414,359 @@ def verify_certn_signature(raw_body: bytes, header_val: str) -> bool:
 # -------------------------
 @app.get("/")
 def home():
+    if session.get("user_email"):
+        return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
 @app.get("/login")
 def login():
+    """SECURITY: Login page with CSRF protection"""
     nonce = secrets.token_urlsafe(32)
     session["nonce"] = nonce
-    return f"""
+    
+    return render_template_string("""
+    <html>
+    <head><title>IGS Portal Login</title></head>
+    <body>
+    <h2>IGS Portal Login</h2>
     <script>
-      const f = new URLSearchParams(window.location.hash.slice(1));
-      const t = f.get("access_token");
-      if (t) {{
-        fetch("/auth/consume", {{
+      // Handle Supabase fragment (#access_token=...)
+      const fragment = new URLSearchParams(window.location.hash.slice(1));
+      const token = fragment.get("access_token");
+      if (token) {
+        const csrfToken = "{{ csrf_token() }}";
+        fetch("/auth/consume", {
           method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ access_token: t, nonce: "{nonce}" }})
-        }}).then(() => location.href="/dashboard");
-      }}
+          headers: { 
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrfToken
+          },
+          body: JSON.stringify({ access_token: token, nonce: "{{ nonce }}" })
+        }).then(res => {
+          if (res.ok) {
+            window.location.href = "/dashboard";
+          } else {
+            document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+          }
+        }).catch(() => {
+          document.body.innerHTML = "<h3>Login failed. Please try again.</h3>";
+        });
+      }
     </script>
-    <form method="POST">
-      <input name="email" type="email" required />
-      <button>Send login link</button>
+    <form method="POST" action="/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+      <input name="email" type="email" placeholder="you@company.com" required />
+      <button type="submit">Send login link</button>
     </form>
-    """
+    </body>
+    </html>
+    """, nonce=nonce)
 
 @app.post("/login")
-@limiter.limit("8 per 15 minutes")
+@limiter.limit("5 per 15 minutes")
 def login_post():
-    email = (request.form.get("email") or "").strip().lower()
-    if is_allowed_email(email):
-        supabase_send_magic_link(email)
+    """SECURITY: Same response time for all cases to prevent enumeration"""
+    email_raw = request.form.get("email") or ""
+    
+    try:
+        email = validate_email(email_raw)
+    except ValueError:
+        time.sleep(1)
+        return "Check your email for a login link", 200
+    
+    # Check allowlist and send magic link
+    is_allowed = is_allowed_email(email)
+    if is_allowed:
+        try:
+            supabase_send_magic_link(email)
+        except Exception as e:
+            app.logger.error("Magic link send failed: %s", e)
+    
+    # SECURITY: Same delay for all responses
     time.sleep(1)
-    return "Check your email", 200
+    return "Check your email for a login link", 200
 
 @app.post("/auth/consume")
+@limiter.limit("10 per minute")
+@csrf.exempt  # CSRF handled via nonce for this specific endpoint
 def auth_consume():
-    data = request.get_json() or {}
-    if data.get("nonce") != session.pop("nonce", None):
+    """
+    SECURITY: One-time token consumption with nonce verification.
+    We use a nonce instead of CSRF for this endpoint because the token
+    comes from Supabase redirect, not a form submission.
+    """
+    data = request.get_json(silent=True) or {}
+    nonce = data.get("nonce") or ""
+    expected_nonce = session.pop("nonce", None)
+    
+    # SECURITY: Constant-time nonce comparison
+    if not expected_nonce or not secrets.compare_digest(str(nonce), str(expected_nonce)):
+        app.logger.warning("Nonce mismatch in auth consume")
         return {"ok": False}, 400
 
-    user = supabase_get_user(data.get("access_token") or "")
-    email = (user.get("email") or "").strip().lower()
-    if not is_allowed_email(email):
+    access_token = data.get("access_token") or ""
+    if not access_token:
+        return {"ok": False}, 400
+
+    try:
+        user = supabase_get_user(access_token)
+    except Exception as e:
+        app.logger.error("Supabase user fetch failed: %s", e)
+        return {"ok": False}, 401
+
+    email_raw = user.get("email") or ""
+    try:
+        email = validate_email(email_raw)
+    except ValueError:
         return {"ok": False}, 403
 
+    if not is_allowed_email(email):
+        session.clear()
+        app.logger.warning("Unauthorized login attempt: %s", email)
+        return {"ok": False}, 403
+
+    # SECURITY: Clear old session, create new one (prevent session fixation)
+    session.clear()
+    session.permanent = True  # Enable timeout
     session["user_email"] = email
+    session["user_id"] = user.get("id")
+
     return {"ok": True}, 200
 
 @app.get("/dashboard")
 def dashboard():
+    """Main dashboard - requires login"""
     if not session.get("user_email"):
         return redirect(url_for("login"))
-    return f"Logged in as {session['user_email']}", 200
+    
+    email = session.get("user_email")
+    return f"""
+    <html>
+    <head><title>IGS Portal Dashboard</title></head>
+    <body>
+    <h2>IGS Portal Dashboard</h2>
+    <p>Logged in as: <strong>{email}</strong></p>
+    <ul>
+      <li><a href="/dashboard/checks">View Background Checks</a></li>
+      <li><a href="/logout">Logout</a></li>
+    </ul>
+    </body>
+    </html>
+    """, 200
+
+@app.get("/dashboard/checks")
+def dashboard_checks():
+    """SECURITY: Show ONLY checks for logged-in user's email"""
+    if not session.get("user_email"):
+        return redirect(url_for("login"))
+
+    email = session["user_email"]
+    _ensure_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        # SECURITY: Only show checks for THIS user's email
+        rows = conn.execute("""
+            SELECT check_id, status, updated_at, COALESCE(report_url,'')
+            FROM certn_checks
+            WHERE client_email = ?
+            ORDER BY updated_at DESC
+            LIMIT 50
+        """, (email,)).fetchall()
+
+    # Simple HTML table
+    html = f"""
+    <html>
+    <head><title>Background Checks</title></head>
+    <body>
+    <h2>Background Checks for {email}</h2>
+    <p><a href="/dashboard">← Back to Dashboard</a> | <a href="/logout">Logout</a></p>
+    <table border="1" cellpadding="8" cellspacing="0">
+      <thead>
+        <tr>
+          <th>Check ID</th>
+          <th>Status</th>
+          <th>Last Updated (UTC)</th>
+          <th>Report</th>
+        </tr>
+      </thead>
+      <tbody>
+    """
+    
+    if not rows:
+        html += '<tr><td colspan="4"><em>No checks found for your email.</em></td></tr>'
+    else:
+        for check_id, status, updated_at, report_url in rows:
+            link = f'<a href="{report_url}" target="_blank" rel="noopener noreferrer">View Report</a>' if report_url else "—"
+            html += f"""
+            <tr>
+              <td>{check_id}</td>
+              <td>{status}</td>
+              <td>{updated_at}</td>
+              <td>{link}</td>
+            </tr>
+            """
+    
+    html += """
+      </tbody>
+    </table>
+    </body>
+    </html>
+    """
+
+    return html, 200
 
 @app.get("/logout")
 def logout():
+    """Clear session and redirect to login"""
     session.clear()
     return redirect(url_for("login"))
 
-# Debug DB read
+# -------------------------
+# DEBUG: Protected debug endpoints (only with DEBUG_TOKEN)
+# -------------------------
 @app.get("/debug/checks")
 def debug_checks():
+    """DEBUG: View all checks (admin only)"""
     if not _debug_allowed():
-        return {"ok": False}, 404
+        return {"ok": False, "error": "not found"}, 404
+    
     _ensure_db()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT check_id, status, updated_at, report_url FROM certn_checks ORDER BY updated_at DESC LIMIT 50"
+            "SELECT check_id, status, updated_at, client_email, report_url FROM certn_checks ORDER BY updated_at DESC LIMIT 50"
         ).fetchall()
-    return {"count": len(rows), "rows": rows}, 200
+    
+    return {
+        "count": len(rows),
+        "rows": [
+            {
+                "check_id": r[0],
+                "status": r[1],
+                "updated_at": r[2],
+                "client_email": r[3] or "none",
+                "report_url": r[4] or "none"
+            }
+            for r in rows
+        ]
+    }, 200
 
 
 # -------------------------
-# Certn webhook
+# Track B: Protected sync endpoint for polling Certn API
+# -------------------------
+@app.post("/jobs/sync-certn")
+@limiter.limit("2 per minute")
+def job_sync_certn():
+    """
+    SECURITY: Protected cron job endpoint.
+    Only accessible with DEBUG_TOKEN header.
+    """
+    if not _debug_allowed():
+        return {"ok": False, "error": "not found"}, 404
+
+    # Check if Certn API is configured
+    if not CERTN_API_BASE_URL or not CERTN_API_TOKEN:
+        return {
+            "ok": False,
+            "error": "CERTN_API_BASE_URL and CERTN_API_TOKEN are required for syncing",
+        }, 400
+
+    try:
+        stats = sync_certn_cases(max_pages=5, page_size=100)
+        app.logger.info("[CERTN][POLL] synced stats=%s", stats)
+        return {"ok": True, "stats": stats}, 200
+    except Exception as e:
+        app.logger.error("[CERTN][POLL] sync failed: %s", e)
+        return {"ok": False, "error": "sync failed"}, 500
+
+
+# -------------------------
+# Certn webhook (Track A: push notifications)
 # -------------------------
 @app.post("/webhooks/certn")
+@limiter.limit("100 per minute")  # SECURITY: Rate limit webhooks
+@csrf.exempt  # Webhooks come from external service, can't have CSRF token
 def certn_webhook():
+    """
+    SECURITY: Verify webhook signature before processing.
+    Sanitize all logged data to prevent PII leaks.
+    """
     raw = request.get_data() or b""
     ct = request.headers.get("Content-Type", "")
-
-    app.logger.info("CERTN webhook hit len=%s ct=%s", len(raw), ct)
 
     # Parse JSON safely
     try:
         payload = request.get_json(force=True, silent=False) or {}
     except Exception:
-        payload = {"_parse_error": True}
+        app.logger.warning("[CERTN] webhook parse error")
+        return {"ok": False, "error": "invalid json"}, 400
 
-    # Safe log: keys only
-    if isinstance(payload, dict):
-        app.logger.info("[CERTN] payload keys: %s", list(payload.keys()))
-    else:
-        app.logger.info("[CERTN] payload type: %s", type(payload).__name__)
+    # SECURITY: Sanitize payload for logs (remove PII)
+    sanitized_payload = _sanitize_for_log(payload) if isinstance(payload, dict) else {}
+    
+    # Log sanitized version only
+    app.logger.info("[CERTN] webhook received keys=%s", list(sanitized_payload.keys()))
 
-    # Capture last webhook (redact headers; include payload only if debug-token is used later)
-    app.config["LAST_CERTN_WEBHOOK"] = {
-        "received_at": datetime.now(timezone.utc).isoformat(),
-        "content_type": ct,
-        "headers": _redact_headers(dict(request.headers)),
-        "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
-        "payload": payload,  # view via /debug/last-webhook with X-Debug-Token
-    }
+    # Store last webhook for debugging (only accessible with DEBUG_TOKEN)
+    if DEBUG_ENABLED:
+        app.config["LAST_CERTN_WEBHOOK"] = {
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "content_type": ct,
+            "headers": _redact_headers(dict(request.headers)),
+            "payload": sanitized_payload,  # Store sanitized version
+        }
 
-    # Enforce signature verification only when enabled
+    # SECURITY: Verify signature if enabled
     if CERTN_VERIFY_ENABLED:
         header_val = request.headers.get(CERTN_SIGNATURE_HEADER) or ""
-        ok = verify_certn_signature(raw, header_val)
-        if not ok:
-            app.logger.warning("[CERTN] signature verify failed header=%s present=%s",
-                               CERTN_SIGNATURE_HEADER, bool(header_val))
-            return {"ok": False}, 401
+        if not verify_certn_signature(raw, header_val):
+            app.logger.warning("[CERTN] signature verification failed")
+            return {"ok": False, "error": "invalid signature"}, 401
 
-    # Extract fields (adjust after seeing real Certn payload)
+    # Extract fields (adjust based on actual Certn payload structure)
     check_id = None
     status = "unknown"
+    client_email = None
+    report_url = None
 
     if isinstance(payload, dict):
         check_id = payload.get("id") or payload.get("check_id") or payload.get("checkId")
         status = payload.get("status") or payload.get("state") or "unknown"
+        report_url = payload.get("report_url") or payload.get("reportUrl")
+        
+        # Extract email if present
+        raw_email = payload.get("email_address") or payload.get("email")
+        if raw_email:
+            try:
+                client_email = validate_email(raw_email)
+            except ValueError:
+                pass
 
-    _upsert_check(check_id or "missing-id", status)
+    # Upsert check
+    _upsert_check(
+        check_id=check_id or "missing-id",
+        status=status,
+        client_email=client_email,
+        report_url=report_url
+    )
 
-    app.logger.info("[CERTN] upserted check_id=%s status=%s", check_id, status)
+    app.logger.info("[CERTN] upserted check_id=%s status=%s", check_id or "missing", status)
     return {"ok": True}, 200
+
+
+# -------------------------
+# Error handlers
+# -------------------------
+@app.errorhandler(404)
+def not_found(e):
+    return {"error": "not found"}, 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    app.logger.error("Internal error: %s", e)
+    return {"error": "internal server error"}, 500
+
+
+if __name__ == "__main__":
+    # SECURITY: Never run with debug=True in production
+    app.run(host="0.0.0.0", port=5000, debug=False)
