@@ -1,7 +1,6 @@
 import os
 import time
 import secrets
-import sqlite3
 import hmac
 import hashlib
 from datetime import datetime, timezone
@@ -26,11 +25,10 @@ app = Flask(__name__)
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or ""
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or ""  # NEW: For writing to DB
 SITE_URL = (os.environ.get("SITE_URL") or "https://portal.irongatescreening.com").rstrip("/")
 AUTH_REDIRECT_TO = (os.environ.get("AUTH_REDIRECT_TO") or f"{SITE_URL}/auth/callback").rstrip("/")
 ALLOWLIST_EMAILS = os.environ.get("ALLOWLIST_EMAILS") or ""
-
-DB_PATH = os.environ.get("DB_PATH") or "/opt/render/project/src/instance/igs.db"
 
 CERTN_VERIFY_ENABLED = (os.environ.get("CERTN_VERIFY_ENABLED") or "false").lower() in ("1", "true", "yes", "on")
 CERTN_SIGNATURE_HEADER = os.environ.get("CERTN_SIGNATURE_HEADER") or "Certn-Signature"
@@ -38,6 +36,7 @@ CERTN_WEBHOOK_SECRET = os.environ.get("CERTN_WEBHOOK_SECRET") or ""
 
 DEBUG_ENABLED = (os.environ.get("DEBUG_ENABLED") or "false").lower() in ("1", "true", "yes", "on")
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN") or ""
+CRON_TOKEN = os.environ.get("CRON_TOKEN") or ""  # NEW: Separate token for cron jobs
 
 LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "INFO").upper()
 app.logger.setLevel(LOG_LEVEL)
@@ -49,6 +48,9 @@ CERTN_API_AUTH_SCHEME = (os.environ.get("CERTN_API_AUTH_SCHEME") or "Token").str
 
 if not FLASK_SECRET_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Missing required environment variables: FLASK_SECRET_KEY, SUPABASE_URL, SUPABASE_ANON_KEY")
+
+if not SUPABASE_SERVICE_KEY:
+    app.logger.warning("SUPABASE_SERVICE_KEY not set - check storage will not work")
 
 
 # -------------------------
@@ -126,14 +128,19 @@ def is_allowed_email(email: str) -> bool:
 
 
 # -------------------------
-# SECURITY: Debug token helpers (only you can access)
+# SECURITY: Token verification helpers
 # -------------------------
 def _debug_allowed() -> bool:
-    """SECURITY: Constant-time debug token check"""
+    """SECURITY: Check if debug token is valid (for /debug endpoints)"""
     if not DEBUG_ENABLED:
         return False
     token = request.headers.get("X-Debug-Token") or ""
     return bool(DEBUG_TOKEN) and secrets.compare_digest(token, DEBUG_TOKEN)
+
+def _cron_allowed() -> bool:
+    """SECURITY: Check if cron token is valid (for /jobs endpoints)"""
+    token = request.headers.get("X-Cron-Token") or ""
+    return bool(CRON_TOKEN) and secrets.compare_digest(token, CRON_TOKEN)
 
 def _redact_headers(headers: dict) -> dict:
     """SECURITY: Redact sensitive headers from logs"""
@@ -168,13 +175,6 @@ def _sanitize_for_log(data: dict, max_depth: int = 2) -> dict:
         else:
             sanitized[k] = v
     return sanitized
-
-@app.get("/debug/last-webhook")
-def debug_last_webhook():
-    """DEBUG: View last webhook (protected by debug token)"""
-    if not _debug_allowed():
-        return {"ok": False, "error": "not found"}, 404
-    return app.config.get("LAST_CERTN_WEBHOOK", {"ok": True, "note": "no webhook yet"}), 200
 
 
 # -------------------------
@@ -225,7 +225,7 @@ def validate_email(email: str) -> str:
     return cleaned
 
 def validate_check_id(check_id: str) -> str:
-    """SECURITY: Validate check_id to prevent SQL injection"""
+    """SECURITY: Validate check_id to prevent injection"""
     if not check_id or not isinstance(check_id, str):
         raise ValueError("Invalid check_id")
     # Allow alphanumeric, hyphens, underscores only
@@ -236,31 +236,27 @@ def validate_check_id(check_id: str) -> str:
 
 
 # -------------------------
-# Database helpers
+# Database helpers (Supabase Postgres)
 # -------------------------
-def _ensure_db():
-    """Initialize SQLite database with proper schema"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS certn_checks (
-                check_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                client_email TEXT,
-                report_url TEXT
-            )
-        """)
-        # SECURITY: Index on client_email for faster queries
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_client_email 
-            ON certn_checks(client_email)
-        """)
-        conn.commit()
+def _supabase_service_headers() -> dict:
+    """Headers for Supabase service_role requests (bypass RLS)"""
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",  # Don't return data, just confirm success
+    }
 
 def _upsert_check(check_id: str, status: str, client_email=None, report_url=None):
-    """SECURITY: Safely upsert check with validated inputs"""
+    """
+    SECURITY: Safely upsert check to Supabase with validated inputs.
+    Uses service_role key to bypass RLS (webhooks don't have user context).
+    """
     if not check_id:
+        return
+    
+    if not SUPABASE_SERVICE_KEY:
+        app.logger.error("SUPABASE_SERVICE_KEY not set - cannot upsert check")
         return
     
     try:
@@ -269,20 +265,54 @@ def _upsert_check(check_id: str, status: str, client_email=None, report_url=None
         app.logger.warning("Invalid check_id: %s", e)
         return
     
-    _ensure_db()
     now = datetime.now(timezone.utc).isoformat()
     
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO certn_checks (check_id, status, updated_at, client_email, report_url)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(check_id) DO UPDATE SET
-                status=excluded.status,
-                updated_at=excluded.updated_at,
-                client_email=excluded.client_email,
-                report_url=excluded.report_url
-        """, (validated_id, status or "unknown", now, client_email, report_url))
-        conn.commit()
+    # Upsert to Supabase (REST API)
+    url = f"{SUPABASE_URL}/rest/v1/certn_checks"
+    headers = _supabase_service_headers()
+    headers["Prefer"] = "resolution=merge-duplicates"  # Upsert on conflict
+    
+    payload = {
+        "check_id": validated_id,
+        "status": status or "unknown",
+        "updated_at": now,
+        "client_email": client_email,
+        "report_url": report_url,
+    }
+    
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        if r.status_code not in (200, 201):
+            app.logger.error("Supabase upsert failed: %s %s", r.status_code, r.text)
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Supabase upsert request failed: %s", e)
+
+def _get_checks_for_user(email: str, limit: int = 50) -> list:
+    """
+    SECURITY: Get checks for a specific user email.
+    Uses anon key + RLS policy ensures users only see their own data.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/certn_checks"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    }
+    params = {
+        "client_email": f"eq.{email}",
+        "order": "updated_at.desc",
+        "limit": limit,
+    }
+    
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            app.logger.error("Supabase get checks failed: %s", r.status_code)
+            return []
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Supabase get checks request failed: %s", e)
+        return []
 
 
 # -------------------------
@@ -354,7 +384,7 @@ def certn_list_cases(page_size: int = 100, page: int = 1) -> dict:
 
 def sync_certn_cases(max_pages: int = 5, page_size: int = 100) -> dict:
     """
-    Pull cases from Certn and upsert check statuses into SQLite.
+    Pull cases from Certn and upsert check statuses into Supabase.
     Returns counts for logging/observability.
     """
     total_cases = 0
@@ -561,17 +591,7 @@ def dashboard_checks():
         return redirect(url_for("login"))
 
     email = session["user_email"]
-    _ensure_db()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        # SECURITY: Only show checks for THIS user's email
-        rows = conn.execute("""
-            SELECT check_id, status, updated_at, COALESCE(report_url,'')
-            FROM certn_checks
-            WHERE client_email = ?
-            ORDER BY updated_at DESC
-            LIMIT 50
-        """, (email,)).fetchall()
+    rows = _get_checks_for_user(email, limit=50)
 
     # Simple HTML table
     html = f"""
@@ -595,7 +615,12 @@ def dashboard_checks():
     if not rows:
         html += '<tr><td colspan="4"><em>No checks found for your email.</em></td></tr>'
     else:
-        for check_id, status, updated_at, report_url in rows:
+        for row in rows:
+            check_id = row.get("check_id", "")
+            status = row.get("status", "unknown")
+            updated_at = row.get("updated_at", "")
+            report_url = row.get("report_url", "")
+            
             link = f'<a href="{report_url}" target="_blank" rel="noopener noreferrer">View Report</a>' if report_url else "—"
             html += f"""
             <tr>
@@ -622,47 +647,29 @@ def logout():
     return redirect(url_for("login"))
 
 # -------------------------
-# DEBUG: Protected debug endpoints (only with DEBUG_TOKEN)
+# DEBUG: Protected debug endpoints (only with DEBUG_TOKEN when DEBUG_ENABLED=true)
 # -------------------------
-@app.get("/debug/checks")
-def debug_checks():
-    """DEBUG: View all checks (admin only)"""
+@app.get("/debug/last-webhook")
+def debug_last_webhook():
+    """DEBUG: View last webhook (protected by debug token)"""
     if not _debug_allowed():
         return {"ok": False, "error": "not found"}, 404
-    
-    _ensure_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT check_id, status, updated_at, client_email, report_url FROM certn_checks ORDER BY updated_at DESC LIMIT 50"
-        ).fetchall()
-    
-    return {
-        "count": len(rows),
-        "rows": [
-            {
-                "check_id": r[0],
-                "status": r[1],
-                "updated_at": r[2],
-                "client_email": r[3] or "none",
-                "report_url": r[4] or "none"
-            }
-            for r in rows
-        ]
-    }, 200
+    return app.config.get("LAST_CERTN_WEBHOOK", {"ok": True, "note": "no webhook yet"}), 200
 
 
 # -------------------------
-# Track B: Protected sync endpoint for polling Certn API
+# CRON: Protected sync endpoint for polling Certn API
 # -------------------------
 @app.post("/jobs/sync-certn")
 @limiter.limit("2 per minute")
 def job_sync_certn():
     """
     SECURITY: Protected cron job endpoint.
-    Only accessible with DEBUG_TOKEN header.
+    Only accessible with CRON_TOKEN header (separate from DEBUG_TOKEN).
+    Set up Render Cron Job to call this with: X-Cron-Token header
     """
-    if not _debug_allowed():
-        return {"ok": False, "error": "not found"}, 404
+    if not _cron_allowed():
+        return {"ok": False, "error": "unauthorized"}, 401
 
     # Check if Certn API is configured
     if not CERTN_API_BASE_URL or not CERTN_API_TOKEN:
@@ -742,7 +749,7 @@ def certn_webhook():
             except ValueError:
                 pass
 
-    # Upsert check
+    # Upsert check to Supabase
     _upsert_check(
         check_id=check_id or "missing-id",
         status=status,
